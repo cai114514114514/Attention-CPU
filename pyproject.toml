@@ -1,0 +1,22 @@
+[project]
+name = "tfcpu"
+version = "0.1.0"
+description = "A small CPU built from a hand-wired looped Transformer (hardmax attention + ReLU MLP)"
+requires-python = ">=3.12"
+dependencies = ["torch>=2.4", "numpy>=1.26"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+notebook = ["jupyter", "ipykernel", "matplotlib", "nbconvert"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+default-groups = ["dev", "notebook"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
