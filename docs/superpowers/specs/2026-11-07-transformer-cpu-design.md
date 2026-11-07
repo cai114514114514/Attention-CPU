@@ -1,0 +1,188 @@
+# Transformer CPU（tfcpu）设计文档
+
+日期：2026-11-07
+状态：待审阅
+
+## 1. 目标
+
+用一个**权重手工构造**的 Transformer 实现一台多指令小 CPU，证明 Transformer 真的能做通用计算：
+
+- 一次前向传播 = 执行一条指令；外层循环只做 `x = model(x)`，不含任何计算逻辑。
+- 模型内部只由 `nn.Linear`、ReLU、hardmax attention、残差连接组成。
+- 结果**比特级精确**：对任意合法机器状态 `s`，`model(encode(s)) == encode(step_ref(s))`（float64 张量逐元素相等）。
+- 以 Python 库 + Jupyter notebook 的形式使用。
+
+理论背景：Pérez et al.《Attention is Turing Complete》；Giannou et al. 2023《Looped Transformers as Programmable Computers》。
+
+### 不在范围内（YAGNI）
+
+- 训练 / 梯度学习。
+- 可视化前端（notebook 中用 matplotlib 画图即可）。
+- softmax 近似版本（可作为后续工作：大温度系数 softmax + 误差界）。
+- 中断、I/O 设备、乘除法指令。
+
+## 2. 机器规格
+
+| 项目 | 规格 |
+|---|---|
+| 字长 | 16 位有符号整数，范围 −32768…32767，算术溢出回绕（mod 2^16） |
+| 寄存器 | R0–R3 |
+| PC | 整数，0–63 |
+| 程序区 | 64 条指令（哈佛结构，程序不可被 STORE 修改） |
+| 数据区 | 64 个字 M[0..63] |
+| 停机 | `halted` 标志；置位后每一步状态完全不变 |
+
+### 2.1 指令集（9 条）
+
+| 编号 | 指令 | 语义（未写明的 PC 更新均为 PC+1） |
+|---|---|---|
+| 0 | `HALT` | halted = 1；PC 不变 |
+| 1 | `LOADI rd, imm` | R[rd] = wrap(imm) |
+| 2 | `LOAD rd, ra, imm` | R[rd] = M[clampA(R[ra] + imm)] |
+| 3 | `STORE rs, ra, imm` | M[clampA(R[ra] + imm)] = R[rs] |
+| 4 | `ADD rd, ra, rb` | R[rd] = wrap(R[ra] + R[rb]) |
+| 5 | `SUB rd, ra, rb` | R[rd] = wrap(R[ra] − R[rb]) |
+| 6 | `JZ ra, imm` | 若 R[ra] == 0，PC = clampA(imm) |
+| 7 | `JNEG ra, imm` | 若 R[ra] < 0，PC = clampA(imm) |
+| 8 | `JMP imm` | PC = clampA(imm) |
+
+定义：
+
+- `wrap(x) = ((x + 32768) mod 65536) − 32768`
+- `clampA(x) = min(max(x, 0), 63)`
+- `PC + 1`：若 PC = 63 则结果 clampA(64) = 63（即停在最后一条，不回绕）。
+- 立即数 `imm` 为 16 位有符号整数（汇编器检查范围）。
+- 指令字段：每条指令统一存 `op, rd, ra, rb, imm`；不用的字段为 0。`STORE` 的 rs 存在 `rb` 字段；`JZ/JNEG` 的被测寄存器存在 `ra` 字段。
+
+**全定义语义**：任何状态、任何指令都有唯一确定的下一状态，不存在未定义行为。这使随机程序差分测试成为可能。
+
+### 2.2 汇编器
+
+- 每行一条指令，`;` 开始注释，`name:` 定义标签，标签可用作 `imm`。
+- 寄存器写作 `r0`–`r3`。
+- `.data` 段：`.data addr v1 v2 ...` 初始化 M[addr..]。
+- 程序不足 64 条时用 `HALT` 填充。
+- 错误（未知助记符、未定义标签、立即数越界、程序超过 64 条）抛出带行号的 `AsmError`。
+- API：`assemble(text) -> Program`，`Program` 含 `instrs: list[Instr]` 与 `mem: list[int]`（长度 64）。
+
+## 3. 状态编码
+
+### 3.1 序列
+
+共 129 个 token，顺序固定：
+
+- token 0：CPU
+- token 1–64：PROG[0..63]
+- token 65–128：MEM[0..63]
+
+### 3.2 残差流字段（`layout.py`）
+
+每个字段是残差流中一个有名字的维度（或一组维度）。`layout.py` 提供名字 → 下标的映射，所有权重构造都通过名字访问，不出现裸下标。
+
+| 类别 | 字段 | 说明 |
+|---|---|---|
+| 公共 | `one` | 恒为 1 |
+| 公共 | `is_cpu, is_prog, is_mem` | token 类型 |
+| 公共 | `a, a2` | 地址 a 与 a²（CPU token 为 0） |
+| PROG | `op[0..8]` | opcode one-hot |
+| PROG | `rd[0..3], ra[0..3], rb[0..3]` | 寄存器选择 one-hot |
+| PROG | `imm` | 立即数 |
+| MEM | `val` | 内存值 |
+| CPU | `R[0..3], pc, halted` | 寄存器、PC、停机标志 |
+| 草稿 | 见 §4 各块 | 每步结束时清零 |
+
+持久字段只在所属类型的 token 上非零；草稿字段在每步开始和结束时全为 0。`encode` 产生满足该不变式的张量，`decode` 读取持久字段并断言不变式成立。
+
+### 3.3 精确寻址
+
+hardmax attention 用二次型做精确地址匹配：query `(2t, −1)`，key `(a, a2)`，点积为 `t² − (t − a)²`，在 `a = t` 时唯一取到最大值。再加上类型偏置（例如 key 的 `is_prog` 乘以大常数 M）限定只匹配某类 token。由于目标 t 已先夹取到 0–63，最大值始终唯一。
+
+### 3.4 Hardmax
+
+`HardmaxAttention`：分数 = QKᵀ，取每行最大值；若有并列，在并列位置上取平均（averaging hard attention）。CPU 和 MEM 的有用查询在构造上无并列；其他 token 的查询结果只写入草稿字段，随后被清零。
+
+## 4. 单步流水线（6 个块）
+
+每个块 = `x = x + Attn(x)`，再 `x = x + MLP(x)`，其中 `MLP(x) = W2·relu(W1·x + b1) + b2`。不需要 attention 的块，attention 权重为零。
+
+| 块 | Attention | MLP |
+|---|---|---|
+| B1 | CPU 以 `pc` 匹配 PROG 的 `a`，复制 `op, rd, ra, rb, imm` 到草稿 `f_*` | `A = R[ra]`，`B = R[rb]`（门控选择） |
+| B2 | — | `ea = clampA(A + imm)`；`sum = wrap(A+B)`；`dif = wrap(A−B)`；`z = [A==0]`；`n = [A<0]`；`npc = clampA(pc+1)`；`jt = clampA(imm)` |
+| B3 | CPU 以 `ea` 匹配 MEM 的 `a`，读 `val` 到 `mv` | `res = Σ_k op_k·cand_k`（LOADI→imm，LOAD→mv，ADD→sum，SUB→dif）；`take = op_JMP + op_JZ·z + op_JNEG·n` |
+| B4 | — | 写回 `R[i] += [we ∧ rd_i ∧ is_cpu ∧ ¬halted]·(res − R[i])`；`pc += [is_cpu ∧ ¬halted ∧ ¬op_HALT]·(新pc − pc)`；`halted += [is_cpu ∧ op_HALT ∧ ¬halted]`；写内存信号 `sa = ea`（若写使能）否则 −1000，`sv = B` |
+| B5 | 每个 MEM token 匹配 CPU token，复制 `sa, sv` 到 `rx_sa, rx_sv` | `hit = [rx_sa == a] ∧ is_mem` |
+| B6 | — | `val += hit·(rx_sv − val)`；所有草稿字段清零 |
+
+其中 `we = op_LOADI + op_LOAD + op_ADD + op_SUB`，写内存使能 = `op_STORE ∧ is_cpu ∧ ¬halted`。需要两级运算才能得到的量（例如 B4 中依赖 B3 结果的门控）放在后续块里。实现时如发现某个块需要的层数比表中多，可以拆分或插入额外的零 attention 块，但需在 `build.py` 中注释说明，并保持 §6 的不变式测试通过。
+
+### 4.1 ReLU 积木（`gadgets.py`）
+
+全部只用 `relu` 和线性组合，在整数输入上精确：
+
+- `step_ge(x, t) = relu(x − t + 1) − relu(x − t)` → [x ≥ t]
+- `is_zero(x) = relu(x + 1) − 2·relu(x) + relu(x − 1)` → [x == 0]
+- `is_neg(x) = relu(−x) − relu(−x − 1)` → [x < 0]
+- `clamp(x, lo, hi) = lo + relu(x − lo) − relu(x − hi)`
+- `wrap16(x) = x − 65536·[x ≥ 32768] + 65536·[x < −32768]`（输入范围 −65536…65534）
+- `gate(x, s₁..s_k) = relu(x − M·(k − Σsᵢ)) − relu(−x − M·(k − Σsᵢ))` → x·∏sᵢ（sᵢ ∈ {0,1}，|x| < M）
+
+常数 `M = 2^20`。所有中间值的绝对值 < 2^24，float64 下精确。
+
+每个积木在代码中表示为"往 W1/b1/W2/b2 里写若干隐藏单元"的函数，按字段名指定输入与输出。
+
+## 5. 代码结构与 API
+
+项目根目录：Mac 上的 `/Users/wangzhe/TF TC`，uv 管理，Python 3.12，依赖 torch、numpy、pytest、jupyter、matplotlib。
+
+```
+tfcpu/
+  __init__.py   导出 assemble, build_cpu, run, ReferenceCPU, State
+  isa.py        Op 枚举、Instr、常量（WORD=16, NREG=4, NPROG=64, NMEM=64）、wrap/clampA
+  asm.py        assemble()、AsmError
+  reference.py  State（dataclass：regs, pc, halted, mem, program）、step_ref(state) -> State
+  layout.py     Layout：字段名 → 下标；d_model
+  nn.py         HardmaxAttention、MLP、Block、LoopedTransformer（nn.Module）
+  gadgets.py    ReLU 积木：向 MLP 权重中写入隐藏单元
+  build.py      build_cpu() -> LoopedTransformer：逐块构造 B1–B6
+  state.py      encode(State) -> Tensor[129, d_model]、decode(Tensor) -> State
+  run.py        run(model, program, max_steps) -> Trace
+examples/       mul.asm  fib.asm  bubble_sort.asm  gcd.asm
+notebooks/      demo.ipynb
+tests/          test_isa.py  test_asm.py  test_reference.py  test_gadgets.py
+                test_step.py  test_programs.py  test_fuzz.py  test_purity.py
+```
+
+`run` 的实现：
+
+```python
+x = encode(initial_state(program))
+for _ in range(max_steps):
+    x = model(x)
+    trace.append(decode(x))
+    if trace[-1].halted: break
+```
+
+`Trace`：状态列表，`.final` 为最后状态。`decode` 只用于观察，不参与计算；即使去掉 `decode`，对 `x` 的循环本身就完成全部计算。
+
+### 5.1 Notebook（`demo.ipynb`）
+
+1. 汇编并运行冒泡排序，展示结果。
+2. 打印模型结构与参数量，热力图显示若干块的权重矩阵。
+3. 选一步，展示 B1 attention 选中的 PROG token、B3 选中的 MEM token。
+4. 寄存器 / PC 随步数变化的曲线。
+5. 与参考 CPU 逐步对比，输出 "N 步全部一致"。
+
+## 6. 验证
+
+开发采用 TDD。
+
+1. **积木测试**（`test_gadgets.py`）：每个积木在其整个整数输入范围内穷举（如 `wrap16` 测 −65536…65534 全部取值），输出与 Python 精确相等。
+2. **参考 CPU 测试**（`test_reference.py`）：每条指令的语义，包括边界（回绕、地址夹取、PC=63、HALT 后不变）。
+3. **汇编器测试**（`test_asm.py`）：标签、注释、`.data`、各类错误。
+4. **单步不变式**（`test_step.py`）：每条指令 × 随机寄存器/内存/PC/halted，断言 `torch.equal(model(encode(s)), encode(step_ref(s)))`。
+5. **示例程序**（`test_programs.py`）：mul、fib、bubble_sort、gcd 全程逐步与参考 CPU 一致，最终结果正确。
+6. **随机差分测试**（`test_fuzz.py`）：固定种子生成 ≥ 2000 个随机程序（随机指令、操作数、随机初始内存），每个最多 300 步，每一步都比对。
+7. **纯度检查**（`test_purity.py`）：遍历模块树，只允许 `LoopedTransformer / Block / HardmaxAttention / MLP / nn.Linear / nn.ReLU`；`HardmaxAttention.forward` 中只做矩阵乘、取最大、平均。
+
+完成标准：以上测试全部通过，notebook 能从头到尾运行。
