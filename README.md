@@ -33,3 +33,7 @@ uv venv --system-site-packages .venv && uv pip install -p .venv nbconvert
 
 测试包括：积木穷举、每条指令的单步比特级不变式、4 个示例程序全程对比、
 2000 个随机程序 × 300 步差分测试、以及"只用 Transformer 组件"的纯度检查。
+
+## 许可证
+
+MIT，见 `LICENSE`。

@@ -3,6 +3,8 @@ name = "tfcpu"
 version = "0.1.0"
 description = "A small CPU built from a hand-wired looped Transformer (hardmax attention + ReLU MLP)"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["torch>=2.4", "numpy>=1.26"]
 
 [dependency-groups]
