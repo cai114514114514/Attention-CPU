@@ -32,21 +32,27 @@ finals = run_fast(model, [prog] * 1000)
 
 ## 测速
 
-`.venv/bin/python bench.py`，Apple M 系列 Mac，冒泡排序；每行计时后都抽查结果与参考 CPU 一致：
+`.venv/bin/python bench.py`，Apple M4 Max，冒泡排序；每行计时后都抽查结果与参考 CPU 一致：
 
 | 架构 | 精度 | 设备 | 执行方式 | 同时运行的机器数 | 指令/秒 |
 |---|---|---|---|---:|---:|
-| v1 | float64 | cpu | 完整模型 | 1 | 1,779 |
-| v2 | float32 | cpu | 完整模型 | 1 | 2,257 |
-| v2 | float32 | cpu | FastCPU | 1 | 8,692 |
-| v1 | float64 | cpu | 完整模型 | 512 | 3,966 |
-| v2 | float32 | mps | 完整模型 | 4,096 | 76,749 |
-| v2 | float32 | cpu | FastCPU | 4,096 | 309,953 |
-| v2 | float32 | mps | FastCPU | 16,384 | **1,271,812** |
+| v1 | float64 | cpu | 完整模型 | 1 | 1,778 |
+| v2 | float32 | cpu | 完整模型 | 1 | 2,268 |
+| v2 | float32 | cpu | FastCPU（PyTorch） | 1 | 8,487 |
+| v2 | float32 | cpu | **NativeCPU（C 引擎）** | 1 | **659,845** |
+| v2 | float32 | mps | 完整模型 | 4,096 | 77,129 |
+| v2 | float32 | mps | FastCPU | 16,384 | **1,903,348** |
 
-单个程序时瓶颈是 Python 调度开销（每步约 0.1 ms），MPS 每步还有一次同步，反而比 CPU 慢；批量运行时 FastCPU + MPS 比 v1 快约 700 倍。
+**单个程序：每秒约 66 万条指令，约为 Intel 4004（每秒 46,250–92,500 条）的 7 倍。**
+NativeCPU 是一个约 150 行的 C 引擎（`tfcpu/csrc/engine.c`，首次使用时用系统 `cc` 编译）：
+同一套 v2 权重、同样的运算（非零权重的稀疏矩阵-向量乘、hardmax、ReLU、残差），只算会变的行，
+一次调用跑完整个程序，没有 Python 每步调度开销。它与完整模型逐步比特级一致（`tests/test_native.py`），
+在一个 100 万步的程序上与参考 CPU 结果相同。
 
-演示：`notebooks/demo.ipynb`（权重热力图、attention 落点、寄存器曲线、自己写程序）。
+```python
+from tfcpu.native import run_native
+final, steps = run_native(build_cpu("v2", torch.float32), prog)
+```
 
 ## 环境与测试
 
