@@ -16,9 +16,10 @@ import numpy as np
 import torch
 
 from .fast import FastCPU
-from .isa import NMEM, Program
+from .isa import NMEM, NOPS, NREG, Program
 from .nn import LoopedTransformer
 from .reference import State, initial_state
+from .routing import NCOMBO, route
 from .state import CPU, MEM0, NTOK, decode, encode
 
 _SRC = Path(__file__).with_name("csrc") / "engine.c"
@@ -38,10 +39,15 @@ class _Model(C.Structure):
         ("out", C.c_int32), ("out_flag", C.c_int32),
         ("dk1", C.c_int32), ("dv1", C.c_int32), ("q1", _CSR), ("o1", _CSR), ("K1", f32p), ("V1", f32p),
         ("m1a", _CSR), ("m1b", _CSR), ("c1a", f32p), ("c1b", f32p),
-        ("H", C.c_int32), ("dk2", C.c_int32), ("dv2", C.c_int32),
+        ("H", C.c_int32), ("R", C.c_int32), ("dk2", C.c_int32), ("dv2", C.c_int32),
         ("q2", _CSR), ("k2", _CSR), ("v2", _CSR), ("o2", _CSR),
         ("K2", f32p), ("V2", f32p), ("Qs", f32p), ("best", f32p),
         ("m2a", _CSR), ("m2b", _CSR), ("c2a", f32p), ("c2b", f32p),
+        ("m1bT", _CSR), ("m2bT", _CSR),
+        ("f_op0", C.c_int32), ("f_rd0", C.c_int32), ("f_ra0", C.c_int32), ("f_rb0", C.c_int32),
+        ("nops", C.c_int32), ("nreg", C.c_int32),
+        ("r1_off", i32p), ("r1_idx", i32p), ("r2_off", i32p), ("r2_idx", i32p),
+        ("rm_idx", i32p), ("rm_n", C.c_int32),
     ]
 
 
@@ -68,12 +74,16 @@ def _arr(t) -> np.ndarray:
 
 
 class NativeCPU:
-    """One machine. load(program | state | tensor), then step(n)."""
+    """One machine. load(program | state | tensor), then step(n).
 
-    ERRORS = {-1: "fetch tie", -2: "load tie", -3: "store-port tie"}
+    routed=True (default) evaluates only the MLP units that tfcpu.routing proves can be non-zero
+    for the decoded instruction; routed=False evaluates every unit. Both are bit-identical.
+    """
+
+    ERRORS = {-1: "fetch tie", -2: "read-head tie", -3: "store-port tie"}
     OUT_CAP = 1 << 16
 
-    def __init__(self, model: LoopedTransformer):
+    def __init__(self, model: LoopedTransformer, routed: bool = True):
         if getattr(model, "arch", None) != "v2":
             raise ValueError("NativeCPU needs the v2 architecture")
         self.model = model.float() if next(model.parameters()).dtype != torch.float32 else model
@@ -88,8 +98,26 @@ class NativeCPU:
             q2=self._csr(a2.q.weight), k2=self._csr(a2.k.weight), v2=self._csr(a2.v.weight), o2=self._csr(a2.o.weight),
             m2a=self._csr(b2.mlp.fc1.weight), m2b=self._csr(b2.mlp.fc2.weight),
             c2a=self._ptr(_arr(b2.mlp.fc1.bias)), c2b=self._ptr(_arr(b2.mlp.fc2.bias)),
-            dk1=a1.d_k, dv1=a1.d_v, H=a2.n_heads, dk2=a2.d_k, dv2=a2.d_v,
+            dk1=a1.d_k, dv1=a1.d_v, H=a2.n_heads, R=getattr(a2, "n_read_heads", 1), dk2=a2.d_k, dv2=a2.d_v,
+            m1bT=self._csr(b1.mlp.fc2.weight.T), m2bT=self._csr(b2.mlp.fc2.weight.T),
+            f_op0=self.L["f_op0"], f_rd0=self.L["f_rd0"], f_ra0=self.L["f_ra0"], f_rb0=self.L["f_rb0"],
+            nops=NOPS, nreg=NREG,
         )
+        self.routed = routed
+        if routed:
+            r = route(self.model)
+            lists1, lists2, mem = r["b1"], r["b2"], r["mem"]
+        else:
+            all1 = np.arange(b1.mlp.fc1.out_features, dtype=np.int32)
+            all2 = np.arange(b2.mlp.fc1.out_features, dtype=np.int32)
+            lists1, lists2, mem = [all1] * NCOMBO, [all2] * NCOMBO, all2
+        self.live = {"b1": np.array([len(x) for x in lists1]), "b2": np.array([len(x) for x in lists2]),
+                     "mem": len(mem), "h1": b1.mlp.fc1.out_features, "h2": b2.mlp.fc1.out_features}
+        for name, lists in (("r1", lists1), ("r2", lists2)):
+            off = np.concatenate([[0], np.cumsum([len(x) for x in lists])]).astype(np.int32)
+            idx = np.concatenate(lists).astype(np.int32)
+            self._static[f"{name}_off"], self._static[f"{name}_idx"] = self._ptr(off, i32p), self._ptr(idx, i32p)
+        self._static["rm_idx"], self._static["rm_n"] = self._ptr(np.ascontiguousarray(mem, dtype=np.int32), i32p), len(mem)
         self._lib = _load_lib()
         self.x_np: np.ndarray | None = None
 
@@ -115,7 +143,7 @@ class NativeCPU:
         self.x_np = np.ascontiguousarray(x.numpy().copy())
         self.x = torch.from_numpy(self.x_np)                 # shares memory: always current
         nmem = NMEM
-        self._dyn = [_arr(f.K1[0]), _arr(f.V1[0]), _arr(f.K2load[0]), _arr(f.V2load[0]),
+        self._dyn = [_arr(f.K1[0]), _arr(f.V1[0]), _arr(f.K2read[0]), _arr(f.V2read[0]),
                      _arr(f.Qstore[0]), _arr(f.best_other[0])]
         K1, V1, K2, V2, Qs, best = self._dyn
         self._m = _Model(T=NTOK, d=self.L.d, cpu=CPU, mem0=MEM0, nmem=nmem, halted=self.L["halted"],

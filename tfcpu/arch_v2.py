@@ -10,8 +10,12 @@
             extended ISA (§8): ADDI raw/overflow per register, JR target, SP-1 / SP+1,
             MUL micro-step: [mstep==0], [mstep==16], [mb<0], wrap bits of 2*macc(+ma), 2*mb
   B2  attn: head 1  CPU reads MEM[ea]                         (load port)
-            head 2  MEM token i picks the CPU iff sa >= a_i   (store port: two comparators,
-            head 3  MEM token i picks the CPU iff sa <= a_i    their AND is the address decoder)
+            head 2  CPU scores every MEM token 128*val + a    (ARGMAX: a vector instruction,
+                    and copies the winner's address            one head scans all of memory)
+            head 3  MEM token i picks the CPU iff sa >= a_i   (store port: two comparators,
+            head 4  MEM token i picks the CPU iff sa <= a_i    their AND is the address decoder)
+      Heads 1-2 are "read" heads (CPU queries), heads 3-4 "store" heads (MEM queries);
+      the attention module records this as n_read_heads = 2.
       mlp : write registers / pc / halted / sp / out / MUL temps / val; clear scratch
 
 MUL is multi-cycle (like microcoded MUL on real CPUs): one setup step copies the
@@ -45,7 +49,7 @@ def make_layout() -> Layout:
            "take", "jt", "npc",
            "sel_a", "jr", "addi_raw", "addi_hi", "addi_lo", "spm", "spp",    # extended ISA
            "mul_setup", "mul_done", "mneg", "c0_hi", "c0_lo", "c1_hi", "c1_lo", "mb_hi", "mb_lo",
-           "mv", "rx_sv", "got_ge", "got_le"]                                # B2 attn
+           "mv", "amax", "rx_sv", "got_ge", "got_le"]                        # B2 attn
     )
     return Layout(PERSISTENT, scratch)
 
@@ -79,12 +83,14 @@ def _b1(L):
         is_zero(b, R, "take", conds=[ra, _op(Op.JZ)])
         is_neg(b, R, "take", conds=[ra, _op(Op.JNEG)])
         x = R + F("f_imm")                                            # ADDI, speculatively per register
-        gate(b, x, [ra], "addi_raw")
-        step_ge(b, x, HALF, "addi_hi", conds=[ra])
-        step_ge(b, -x, HALF + 1, "addi_lo", conds=[ra])
+        sel = [ra, _op(Op.ADDI)]
+        gate(b, x, sel, "addi_raw")
+        step_ge(b, x, HALF, "addi_hi", conds=sel)
+        step_ge(b, -x, HALF + 1, "addi_lo", conds=sel)
         for j in range(NREG):
-            pair = [ra, F(f"f_rb{j}")]
-            for name, x in (("add", R + F(f"R{j}")), ("sub", R - F(f"R{j}"))):
+            # the op flag in each gate is "clock gating": the unit is provably off for other ops
+            for name, x, o in (("add", R + F(f"R{j}"), Op.ADD), ("sub", R - F(f"R{j}"), Op.SUB)):
+                pair = [ra, F(f"f_rb{j}"), _op(o)]
                 gate(b, x, pair, f"{name}_raw")
                 step_ge(b, x, HALF, f"{name}_hi", conds=pair)          # raw >= 32768
                 step_ge(b, -x, HALF + 1, f"{name}_lo", conds=pair)     # raw < -32768
@@ -108,6 +114,14 @@ def _b1(L):
 
 
 STORE_OFF = 4096   # pushes the CPU's store-port score negative when it is not storing
+ARG_BIG = 1 << 23  # MEM type bias for ARGMAX: must exceed 128 * 32768 so every MEM score beats PROG/CPU
+
+
+def _argmax_head() -> Head:
+    """CPU query; MEM key 128*val + a (+ ARG_BIG): the unique maximum is the largest value, ties
+    broken by the highest address. Scores stay below 2^24, so float32 is exact. Copies a."""
+    return Head([(F("one"), F("val") * 128 + F("a")), (F("one") * ARG_BIG, F("is_mem"))], [("a", "amax")])
+
 
 
 def _store_heads() -> list[Head]:
@@ -139,7 +153,8 @@ def _wrapped(raw, name: str):
 
 
 def _b2(L):
-    attn = attention(L, [Head(address_match("ea", "is_mem"), [("val", "mv")]), *_store_heads()])
+    attn = attention(L, [Head(address_match("ea", "is_mem"), [("val", "mv")]), _argmax_head(), *_store_heads()])
+    attn.n_read_heads = 2
     b = MLPBuilder(L)
     live = [F("is_cpu"), 1 - F("halted")]
     add = _wrapped(F("add_raw"), "add")
@@ -152,7 +167,7 @@ def _b2(L):
     mul_hold = _op(Op.MUL) - F("mul_done")                   # MUL that is not finishing: pc holds
     # registers
     sources = ((_op(Op.LOADI), F("f_imm")), (_op(Op.LOAD) + _op(Op.POP), F("mv")),
-               (_op(Op.ADD), add), (_op(Op.SUB), sub), (_op(Op.ADDI), addi))
+               (_op(Op.ADD), add), (_op(Op.SUB), sub), (_op(Op.ADDI), addi), (_op(Op.ARGMAX), F("amax")))
     for i in range(NREG):
         R, rd = F(f"R{i}"), F(f"f_rd{i}")
         for cond, value in sources:

@@ -77,3 +77,11 @@ def test_extended_mnemonics():
         Instr(Op.MUL, rd=3, ra=1, rb=2),
         Instr(Op.OUT, ra=0),
     )
+
+
+def test_argmax_and_fill():
+    p = assemble("ARGMAX r3\n.data 0 1 2\n.fill 2 61 -5\n")
+    assert p.instrs[0] == Instr(Op.ARGMAX, rd=3)
+    assert p.mem[:3] == (1, 2, -5) and p.mem[62] == -5 and p.mem[63] == 0
+    with pytest.raises(AsmError, match="fill"):
+        assemble(".fill 60 5 1")

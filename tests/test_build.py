@@ -18,7 +18,8 @@ def test_v2_has_no_idle_attention():
     m = build_cpu("v2")
     for blk in m.blocks:
         assert (blk.attn.q.weight != 0).any(), f"{blk.name}: attention is all zero"
-    assert m.blocks[1].attn.n_heads == 3      # load port + two store comparators
+    assert m.blocks[1].attn.n_heads == 4      # load port + ARGMAX + two store comparators
+    assert m.blocks[1].attn.n_read_heads == 2
 
 
 def test_v1_still_six_blocks():

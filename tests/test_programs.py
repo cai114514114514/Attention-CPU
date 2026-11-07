@@ -37,6 +37,7 @@ PRIMES = [p for p in range(2, 50) if all(p % d for d in range(2, p))]
 EXT_CASES = {                                   # use the extended ISA: v2 only
     "factorial": [1, 2, 6, 24, 120, 720, 5040],
     "primes": PRIMES,
+    "argmax_sort": sorted([5, -3, 12, 0, 7, 7, -20, 4], reverse=True),
 }
 
 

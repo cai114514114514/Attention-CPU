@@ -156,3 +156,14 @@ def test_halted_freezes_extended_state():
 def test_outputs_helper():
     prog = Program.from_list([Instr(Op.LOADI, rd=0, imm=7), Instr(Op.OUT, ra=0), Instr(Op.OUT, ra=0)])
     assert outputs(run_ref(prog)) == [7, 7]
+
+
+def test_argmax_picks_largest_then_highest_address():
+    mem = [0] * 64
+    mem[5], mem[9], mem[40] = 7, 7, -3
+    s = step_ref(make([Instr(Op.ARGMAX, rd=2)], mem=mem))
+    assert s.regs[2] == 9 and s.pc == 1                      # tie 7/7 -> higher address
+    s = step_ref(make([Instr(Op.ARGMAX, rd=0)], mem=[-32768] * 63 + [-32767]))
+    assert s.regs[0] == 63
+    s = step_ref(make([Instr(Op.ARGMAX, rd=0)], mem=[0] * 64))
+    assert s.regs[0] == 63

@@ -27,18 +27,24 @@ typedef struct {
     const float *K1, *V1;       /* cached fetch keys / values: T x dk1, T x dv1 */
     CSR m1a, m1b;               /* MLP fc1: h1 x d, fc2: d x h1 */
     const float *c1a, *c1b;     /* their biases */
-    /* block 2 */
-    int32_t H, dk2, dv2;
+    /* block 2: heads 0..R-1 are read heads (CPU queries), heads R..H-1 store heads (MEM queries) */
+    int32_t H, R, dk2, dv2;
     CSR q2, k2, v2, o2;         /* q2,k2: H*dk2 x d, v2: H*dv2 x d, o2: d x H*dv2 */
-    const float *K2;            /* load-head keys: T x dk2 */
-    float *V2;                  /* load-head values: T x dv2 (updated on stores) */
-    const float *Qs;            /* store-head queries of MEM rows: nmem x (H-1) x dk2 */
-    const float *best;          /* best non-CPU score per MEM query: nmem x (H-1) */
+    float *K2;                  /* read-head keys:   T x R x dk2 (rows refreshed on stores) */
+    float *V2;                  /* read-head values: T x R x dv2 (rows refreshed on stores) */
+    const float *Qs;            /* store-head queries of MEM rows: nmem x S x dk2, S = H-R */
+    const float *best;          /* best non-CPU score per MEM query: nmem x S */
     CSR m2a, m2b;
     const float *c2a, *c2b;
+    /* routing: fc2 transposed (one row per hidden unit) and live-unit lists per decoded instruction */
+    CSR m1bT, m2bT;
+    int32_t f_op0, f_rd0, f_ra0, f_rb0, nops, nreg;
+    const int32_t *r1_off, *r1_idx;     /* B1 live units, list k = r1_idx[r1_off[k] .. r1_off[k+1]) */
+    const int32_t *r2_off, *r2_idx;     /* B2 live units on the CPU row */
+    const int32_t *rm_idx; int32_t rm_n; /* B2 live units on a written MEM row */
 } Model;
 
-enum { ERR_FETCH_TIE = -1, ERR_LOAD_TIE = -2, ERR_STORE_TIE = -3 };
+enum { ERR_FETCH_TIE = -1, ERR_READ_TIE = -2, ERR_STORE_TIE = -3 };
 
 static void mv(const CSR *A, const float *x, float *y) {          /* y = A x */
     for (int32_t r = 0; r < A->rows; r++) {
@@ -58,22 +64,33 @@ static void mv_add(const CSR *A, const float *x, float *y) {      /* y += A x */
     }
 }
 
-/* y = x + fc2(relu(fc1 x + b1)) + b2, in place on y (y may alias x) */
-static void mlp_residual(const CSR *fc1, const float *b1, const CSR *fc2, const float *b2,
-                         float *row, float *h, float *tmp, int32_t d) {
-    mv(fc1, row, h);
-    for (int32_t j = 0; j < fc1->rows; j++) { float v = h[j] + b1[j]; h[j] = v > 0.0f ? v : 0.0f; }
-    mv(fc2, h, tmp);
+/* row += fc2(relu(fc1 row + b1)) + b2, evaluating only the listed hidden units (the others are
+ * proven to be exactly 0 for this instruction, so skipping them changes nothing) */
+static void mlp_routed(const CSR *fc1, const float *b1, const CSR *fc2T, const float *b2,
+                       const int32_t *units, int32_t n, float *row, float *tmp, int32_t d) {
+    memset(tmp, 0, (size_t)d * sizeof(float));
+    for (int32_t i = 0; i < n; i++) {
+        int32_t u = units[i];
+        float pre = b1[u];
+        for (int32_t k = fc1->indptr[u]; k < fc1->indptr[u + 1]; k++) pre += fc1->data[k] * row[fc1->indices[k]];
+        if (pre <= 0.0f) continue;
+        for (int32_t k = fc2T->indptr[u]; k < fc2T->indptr[u + 1]; k++) tmp[fc2T->indices[k]] += fc2T->data[k] * pre;
+    }
     for (int32_t i = 0; i < d; i++) row[i] += tmp[i] + b2[i];
 }
 
-/* unique-argmax hardmax of q against T keys; returns the winning row or -1 on a tie */
-static int32_t argmax_unique(const float *q, const float *K, int32_t T, int32_t dk) {
+static int32_t onehot(const float *row, int32_t base, int32_t n) {
+    for (int32_t i = 0; i < n; i++) if (row[base + i] == 1.0f) return i;
+    return 0;
+}
+
+/* unique-argmax hardmax of q against T keys (row stride `stride`); returns the winning row or -1 on a tie */
+static int32_t argmax_unique(const float *q, const float *K, int32_t T, int32_t dk, int32_t stride) {
     int32_t best = 0, ties = 0;
     float bs = 0.0f;
     for (int32_t t = 0; t < T; t++) {
         float s = 0.0f;
-        for (int32_t k = 0; k < dk; k++) s += q[k] * K[t * dk + k];
+        for (int32_t k = 0; k < dk; k++) s += q[k] * K[(size_t)t * stride + k];
         if (t == 0 || s > bs) { bs = s; best = t; ties = 1; }
         else if (s == bs) ties++;
     }
@@ -81,29 +98,33 @@ static int32_t argmax_unique(const float *q, const float *K, int32_t T, int32_t 
 }
 
 static int step(const Model *m, float *x) {
-    const int32_t d = m->d, H = m->H, dk2 = m->dk2, dv2 = m->dv2, S = m->H - 1;
+    const int32_t d = m->d, H = m->H, R = m->R, dk2 = m->dk2, dv2 = m->dv2, S = m->H - m->R;
     float c[d], c1[d], tmp[d], r[d];
-    float h[m->m1a.rows > m->m2a.rows ? m->m1a.rows : m->m2a.rows];
     float q[m->dk1 > H * dk2 ? m->dk1 : H * dk2];
     float kc[H * dk2], vc[H * dv2], hv[H * dv2];
 
     /* ---- block 1: fetch (hardmax over cached PROG keys), then speculative execute */
     memcpy(c, x + m->cpu * d, sizeof c);
     mv(&m->q1, c, q);
-    int32_t t = argmax_unique(q, m->K1, m->T, m->dk1);
+    int32_t t = argmax_unique(q, m->K1, m->T, m->dk1, m->dk1);
     if (t < 0) return ERR_FETCH_TIE;
     mv_add(&m->o1, m->V1 + t * m->dv1, c);
-    mlp_residual(&m->m1a, m->c1a, &m->m1b, m->c1b, c, h, tmp, d);
+    /* route on the decoded instruction (the fetched one-hot fields) */
+    int32_t k = ((onehot(c, m->f_op0, m->nops) * m->nreg + onehot(c, m->f_rd0, m->nreg)) * m->nreg
+                 + onehot(c, m->f_ra0, m->nreg)) * m->nreg + onehot(c, m->f_rb0, m->nreg);
+    mlp_routed(&m->m1a, m->c1a, &m->m1bT, m->c1b, m->r1_idx + m->r1_off[k], m->r1_off[k + 1] - m->r1_off[k], c, tmp, d);
     memcpy(c1, c, sizeof c);
 
-    /* ---- block 2, CPU row: load head; the store heads' output on the CPU row is gated off */
-    mv(&m->q2, c1, q);                                   /* rows 0..dk2-1 are the load head */
-    t = argmax_unique(q, m->K2, m->T, dk2);
-    if (t < 0) return ERR_LOAD_TIE;
+    /* ---- block 2, CPU row: read heads; the store heads' output on the CPU row is gated off */
+    mv(&m->q2, c1, q);
     memset(hv, 0, sizeof hv);
-    memcpy(hv, m->V2 + t * dv2, dv2 * sizeof(float));
+    for (int32_t h = 0; h < R; h++) {
+        t = argmax_unique(q + h * dk2, m->K2 + h * dk2, m->T, dk2, R * dk2);
+        if (t < 0) return ERR_READ_TIE;
+        memcpy(hv + h * dv2, m->V2 + ((size_t)t * R + h) * dv2, dv2 * sizeof(float));
+    }
     mv_add(&m->o2, hv, c);
-    mlp_residual(&m->m2a, m->c2a, &m->m2b, m->c2b, c, h, tmp, d);
+    mlp_routed(&m->m2a, m->c2a, &m->m2bT, m->c2b, m->r2_idx + m->r2_off[k], m->r2_off[k + 1] - m->r2_off[k], c, tmp, d);
 
     /* ---- block 2, store heads: a MEM row is written iff the CPU's key beats its best other key in every store head */
     mv(&m->k2, c1, kc);
@@ -111,7 +132,7 @@ static int step(const Model *m, float *x) {
     for (int32_t i = 0; i < m->nmem; i++) {
         int win = 1;
         for (int32_t s = 0; s < S; s++) {
-            const float *qs = m->Qs + ((size_t)i * S + s) * dk2, *kk = kc + (s + 1) * dk2;
+            const float *qs = m->Qs + ((size_t)i * S + s) * dk2, *kk = kc + (R + s) * dk2;
             float sc = 0.0f;
             for (int32_t k = 0; k < dk2; k++) sc += qs[k] * kk[k];
             float b = m->best[i * S + s];
@@ -121,14 +142,16 @@ static int step(const Model *m, float *x) {
         if (!win) continue;
         float *row = x + (size_t)(m->mem0 + i) * d;
         memcpy(r, row, sizeof r);
-        memset(hv, 0, dv2 * sizeof(float));                  /* load head: not needed on a MEM row */
-        memcpy(hv + dv2, vc + dv2, (size_t)S * dv2 * sizeof(float));
+        memset(hv, 0, (size_t)R * dv2 * sizeof(float));      /* read heads: not needed on a MEM row */
+        memcpy(hv + R * dv2, vc + R * dv2, (size_t)S * dv2 * sizeof(float));
         mv_add(&m->o2, hv, r);
-        mlp_residual(&m->m2a, m->c2a, &m->m2b, m->c2b, r, h, tmp, d);
+        mlp_routed(&m->m2a, m->c2a, &m->m2bT, m->c2b, m->rm_idx, m->rm_n, r, tmp, d);
         memcpy(row, r, sizeof r);
-        float v[H * dv2];
-        mv(&m->v2, r, v);                                    /* refresh this row's cached load value */
-        memcpy(m->V2 + (size_t)(m->mem0 + i) * dv2, v, dv2 * sizeof(float));
+        float kk2[H * dk2], vv2[H * dv2];                    /* refresh this row's read-head caches */
+        mv(&m->k2, r, kk2);
+        mv(&m->v2, r, vv2);
+        memcpy(m->K2 + (size_t)(m->mem0 + i) * R * dk2, kk2, (size_t)R * dk2 * sizeof(float));
+        memcpy(m->V2 + (size_t)(m->mem0 + i) * R * dv2, vv2, (size_t)R * dv2 * sizeof(float));
     }
     memcpy(x + m->cpu * d, c, sizeof c);
     return 0;

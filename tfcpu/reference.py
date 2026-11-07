@@ -78,6 +78,8 @@ def step_ref(s: State) -> State:
         sp = clamp_sp(sp + 1)
     elif op is Op.OUT:
         out, out_flag = regs[ins.ra], True
+    elif op is Op.ARGMAX:
+        regs[ins.rd] = max(range(NMEM), key=lambda j: (mem[j], j))   # largest value, then highest address
     elif op is Op.MUL:
         # multi-cycle: setup, then 16 MSB-first shift-and-add steps; pc holds until the last one
         if mstep == 0:

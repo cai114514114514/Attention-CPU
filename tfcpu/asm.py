@@ -15,7 +15,7 @@ _SIG = {
     Op.HALT: "", Op.LOADI: "ri", Op.LOAD: "rri", Op.STORE: "rri",
     Op.ADD: "rrr", Op.SUB: "rrr", Op.JZ: "ri", Op.JNEG: "ri", Op.JMP: "i",
     Op.ADDI: "rri", Op.JR: "r", Op.CALL: "i", Op.RET: "", Op.PUSH: "r", Op.POP: "r",
-    Op.MUL: "rrr", Op.OUT: "r",
+    Op.MUL: "rrr", Op.OUT: "r", Op.ARGMAX: "r",
 }
 _PSEUDO = {"MOV": ("ADDI", "rr")}      # MOV rd, ra  ==  ADDI rd, ra, 0
 _LABEL = re.compile(r"^([A-Za-z_]\w*)\s*:")
@@ -60,6 +60,15 @@ def assemble(text: str) -> Program:
                 if not WMIN <= v <= WMAX:
                     raise _err(lineno, f".data value {v} out of 16-bit range")
                 mem[addr + k] = v
+            continue
+        if head.lower() == ".fill":                          # .fill addr count value
+            vals = [_num(t, lineno) for t in rest.replace(",", " ").split()]
+            if len(vals) != 3:
+                raise _err(lineno, ".fill needs: addr count value")
+            addr, count, v = vals
+            if addr < 0 or count < 0 or addr + count > NMEM or not WMIN <= v <= WMAX:
+                raise _err(lineno, f".fill {addr} {count} {v} is outside memory 0..{NMEM - 1} or 16-bit range")
+            mem[addr:addr + count] = [v] * count
             continue
         ops = [t.strip() for t in rest.split(",")] if rest.strip() else []
         lines.append((lineno, head, ops))
@@ -115,7 +124,7 @@ def assemble(text: str) -> Program:
             ins = Instr(op, ra=vals[0])
         elif op is Op.PUSH:
             ins = Instr(op, rb=vals[0])
-        elif op is Op.POP:
+        elif op in (Op.POP, Op.ARGMAX):
             ins = Instr(op, rd=vals[0])
         elif op is Op.MUL:
             ins = Instr(op, rd=vals[0], ra=vals[1], rb=vals[2])

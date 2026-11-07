@@ -32,6 +32,8 @@ class Op(IntEnum):
     POP = 14
     MUL = 15
     OUT = 16
+    # vector instruction: one attention head scans all of memory
+    ARGMAX = 17
 
 
 NOPS = len(Op)
@@ -105,6 +107,8 @@ class Instr:
             return f"PUSH  {r(self.rb)}"
         if o is Op.POP:
             return f"POP   {r(self.rd)}"
+        if o is Op.ARGMAX:
+            return f"ARGMAX {r(self.rd)}"
         return f"MUL   {r(self.rd)}, {r(self.ra)}, {r(self.rb)}"
 
 
