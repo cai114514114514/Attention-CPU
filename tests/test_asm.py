@@ -52,3 +52,28 @@ def test_errors(src, msg):
     with pytest.raises(AsmError, match=msg) as e:
         assemble(src)
     assert "line" in str(e.value)
+
+
+def test_extended_mnemonics():
+    p = assemble("""
+        f:  ADDI r1, r2, -3
+            MOV  r0, r1
+            JR   r3
+            CALL f
+            RET
+            PUSH r2
+            POP  r1
+            MUL  r3, r1, r2
+            OUT  r0
+    """)
+    assert p.instrs[:9] == (
+        Instr(Op.ADDI, rd=1, ra=2, imm=-3),
+        Instr(Op.ADDI, rd=0, ra=1, imm=0),
+        Instr(Op.JR, ra=3),
+        Instr(Op.CALL, imm=0),
+        Instr(Op.RET),
+        Instr(Op.PUSH, rb=2),
+        Instr(Op.POP, rd=1),
+        Instr(Op.MUL, rd=3, ra=1, rb=2),
+        Instr(Op.OUT, ra=0),
+    )

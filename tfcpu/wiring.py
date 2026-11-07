@@ -20,6 +20,7 @@ PERSISTENT = (
     + ["imm", "val"]
     + [f"R{i}" for i in range(NREG)]
     + ["pc", "halted"]
+    + ["sp", "out", "out_flag", "mstep", "ma", "mb", "macc"]      # extended ISA (§8)
 )
 FETCH_FIELDS = [f"op{k}" for k in range(NOPS)] + [f"{f}{i}" for f in ("rd", "ra", "rb") for i in range(NREG)] + ["imm"]
 

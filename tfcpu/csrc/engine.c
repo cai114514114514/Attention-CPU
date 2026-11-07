@@ -20,7 +20,7 @@ typedef struct {
 } CSR;
 
 typedef struct {
-    int32_t T, d, cpu, mem0, nmem, halted;
+    int32_t T, d, cpu, mem0, nmem, halted, out, out_flag;   /* field indices on the CPU row */
     /* block 1 */
     int32_t dk1, dv1;
     CSR q1, o1;                 /* q1: dk1 x d, o1: d x dv1 */
@@ -134,14 +134,21 @@ static int step(const Model *m, float *x) {
     return 0;
 }
 
-/* Run up to max_steps instructions on one machine; stops after the step that halts.
+/* Run up to max_steps steps on one machine; stops after the step that halts.
+ * After every step whose out_flag is set, the CPU's `out` value is appended to
+ * outbuf (up to cap values; *nout counts all of them).
  * Returns the number of steps executed, or a negative error code. */
-int64_t tf_run(const Model *m, float *x, int64_t max_steps) {
+int64_t tf_run(const Model *m, float *x, int64_t max_steps, float *outbuf, int64_t cap, int64_t *nout) {
     int64_t n = 0;
-    while (n < max_steps && x[m->cpu * m->d + m->halted] != 1.0f) {
+    const float *cpu = x + (size_t)m->cpu * m->d;
+    while (n < max_steps && cpu[m->halted] != 1.0f) {
         int e = step(m, x);
         if (e) return e;
         n++;
+        if (cpu[m->out_flag] == 1.0f) {
+            if (*nout < cap) outbuf[*nout] = cpu[m->out];
+            (*nout)++;
+        }
     }
     return n;
 }

@@ -81,3 +81,78 @@ def test_halt_is_sticky():
     assert s.halted and s.pc == 0
     s2 = step_ref(make([Instr(Op.LOADI, rd=0, imm=1)], halted=True, regs=(1, 2, 3, 4)))
     assert s2.halted and s2.regs == (1, 2, 3, 4) and s2.pc == 0
+
+
+# ---- extended ISA (ops 9..16) -------------------------------------------------
+import random as _random
+
+from tfcpu.isa import BASE_OPS, SP_EMPTY, mul16
+from tfcpu.reference import run_ref, outputs
+
+
+def test_base_ops_are_the_original_nine():
+    assert BASE_OPS == frozenset(Op(k) for k in range(9))
+
+
+def test_addi_wraps():
+    s = step_ref(make([Instr(Op.ADDI, rd=1, ra=2, imm=5)], regs=(0, 0, 32765, 0)))
+    assert s.regs[1] == -32766 and s.pc == 1
+
+
+def test_jr_clamps():
+    assert step_ref(make([Instr(Op.JR, ra=0)], regs=(17, 0, 0, 0))).pc == 17
+    assert step_ref(make([Instr(Op.JR, ra=0)], regs=(-5, 0, 0, 0))).pc == 0
+    assert step_ref(make([Instr(Op.JR, ra=0)], regs=(999, 0, 0, 0))).pc == 63
+
+
+def test_call_ret_push_pop():
+    s = make([Instr(Op.CALL, imm=10)], pc=0)
+    assert s.sp == SP_EMPTY == 64
+    s = step_ref(s)
+    assert (s.pc, s.sp, s.mem[63]) == (10, 63, 1)
+    s = step_ref(s.replace(program=(Instr(Op.RET),) * 64))
+    assert (s.pc, s.sp) == (1, 64)
+    s = step_ref(make([Instr(Op.PUSH, rb=2)], regs=(0, 0, -7, 0)))
+    assert (s.sp, s.mem[63]) == (63, -7)
+    s = step_ref(s.replace(program=(Instr(Op.POP, rd=3),) * 64))
+    assert (s.sp, s.regs[3]) == (64, -7)
+
+
+def test_stack_pointer_saturates():
+    s = step_ref(make([Instr(Op.PUSH, rb=0)], regs=(5, 0, 0, 0)).replace(sp=0))
+    assert (s.sp, s.mem[0]) == (0, 5)
+    s = step_ref(make([Instr(Op.POP, rd=0)], mem=[0] * 63 + [9]))
+    assert (s.sp, s.regs[0]) == (64, 9)
+    s = step_ref(make([Instr(Op.RET)], mem=[0] * 63 + [500]).replace(sp=63))
+    assert s.pc == 63                                  # return address is clamped
+
+
+def test_out_flag_is_one_step_only():
+    s = step_ref(make([Instr(Op.OUT, ra=1), Instr(Op.LOADI, rd=0, imm=1)], regs=(0, 42, 0, 0)))
+    assert (s.out, s.out_flag) == (42, True)
+    s = step_ref(s)
+    assert (s.out, s.out_flag) == (42, False)
+
+
+def test_mul_takes_17_steps_and_wraps():
+    rng = _random.Random(5)
+    pairs = [(3, 4), (-3, 4), (-3, -4), (32767, 2), (-32768, -1), (255, 257), (0, -9)]
+    pairs += [(rng.randint(-32768, 32767), rng.randint(-32768, 32767)) for _ in range(300)]
+    for a, b in pairs:
+        s = make([Instr(Op.MUL, rd=2, ra=0, rb=1)], regs=(a, b, 0, 0))
+        for k in range(16):
+            s = step_ref(s)
+            assert s.pc == 0 and s.mstep == k + 1
+        s = step_ref(s)
+        assert (s.pc, s.mstep, s.regs[2]) == (1, 0, mul16(a, b)), (a, b)
+    assert mul16(-32768, -1) == -32768 and mul16(300, 300) == 90000 - 65536
+
+
+def test_halted_freezes_extended_state():
+    s = make([Instr(Op.OUT, ra=0)], halted=True).replace(out=3, out_flag=True, mstep=4)
+    assert step_ref(s) == s
+
+
+def test_outputs_helper():
+    prog = Program.from_list([Instr(Op.LOADI, rd=0, imm=7), Instr(Op.OUT, ra=0), Instr(Op.OUT, ra=0)])
+    assert outputs(run_ref(prog)) == [7, 7]

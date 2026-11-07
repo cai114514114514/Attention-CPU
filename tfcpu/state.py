@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from .build import LAYOUT
-from .isa import NMEM, NOPS, NPROG, NREG, Instr, Op
+from .isa import MUL_STEPS, NMEM, NOPS, NPROG, NREG, SP_EMPTY, Instr, Op
 from .layout import Layout
 from .reference import State
 
@@ -27,6 +27,9 @@ def encode(s: State, L: Layout = LAYOUT, dtype: torch.dtype = torch.float64) -> 
     x[CPU, [L[f"R{i}"] for i in range(NREG)]] = s.regs
     x[CPU, L["pc"]] = s.pc
     x[CPU, L["halted"]] = float(s.halted)
+    for f in ("sp", "out", "mstep", "ma", "mb", "macc"):
+        x[CPU, L[f]] = getattr(s, f)
+    x[CPU, L["out_flag"]] = float(s.out_flag)
     addr = np.arange(NPROG)
     rows = PROG0 + addr
     x[rows, L["is_prog"]] = 1.0
@@ -73,6 +76,10 @@ def decode(x: torch.Tensor, L: Layout = LAYOUT) -> State:
     halted = _int(float(cpu[L["halted"]]), "halted")
     if not 0 <= pc < NPROG or halted not in (0, 1):
         raise DecodeError(f"bad pc={pc} / halted={halted}")
+    ext = {f: _int(float(cpu[L[f]]), f) for f in ("sp", "out", "out_flag", "mstep", "ma", "mb", "macc")}
+    if not 0 <= ext["sp"] <= SP_EMPTY or ext["out_flag"] not in (0, 1) or not 0 <= ext["mstep"] <= MUL_STEPS:
+        raise DecodeError(f"bad extended state {ext}")
+    ext["out_flag"] = bool(ext["out_flag"])
     prog = []
     for j in range(NPROG):
         row = x[PROG0 + j]
@@ -81,7 +88,7 @@ def decode(x: torch.Tensor, L: Layout = LAYOUT) -> State:
                       for f in ("rd", "ra", "rb"))
         prog.append(Instr(Op(op), rd, ra, rb, _int(float(row[L["imm"]]), f"PROG[{j}].imm")))
     mem = tuple(_int(float(x[MEM0 + j, L["val"]]), f"M[{j}]") for j in range(NMEM))
-    out = State(tuple(prog), regs, pc, bool(halted), mem)
+    out = State(tuple(prog), regs, pc, bool(halted), mem, **ext)
     if not torch.equal(encode(out, L, x.dtype), x):
         raise DecodeError("tensor is not a canonical encoding (stray values in foreign fields)")
     return out

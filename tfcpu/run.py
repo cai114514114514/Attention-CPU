@@ -7,7 +7,7 @@ import torch
 
 from .isa import Program
 from .nn import LoopedTransformer
-from .reference import State, initial_state
+from .reference import State, initial_state, outputs
 from .state import decode, encode
 
 
@@ -26,9 +26,21 @@ class Trace:
     def __len__(self) -> int:
         return len(self.states)
 
+    @property
+    def output(self) -> list[int]:
+        """Values emitted by OUT, in order."""
+        return outputs(self.states)
+
+
+def check_ops(model: LoopedTransformer, program: Program) -> None:
+    bad = sorted({i.op.name for i in program.instrs} - {o.name for o in model.ops})
+    if bad:
+        raise ValueError(f"architecture {model.arch} does not implement {bad}")
+
 
 @torch.no_grad()
 def run(model: LoopedTransformer, program: Program, max_steps: int = 10_000) -> Trace:
+    check_ops(model, program)
     L, p = model.layout, next(model.parameters())
     x = encode(initial_state(program), L, p.dtype).to(p.device)
     trace = Trace([decode(x, L)])

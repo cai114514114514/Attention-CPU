@@ -58,3 +58,14 @@ def test_halted_machine_does_not_step(m32):
     e.load(prog)
     assert e.step(10) == 1          # the HALT instruction itself
     assert e.step(10) == 0          # already halted: a fixed point, nothing to do
+
+
+def test_native_collects_out_stream(m32):
+    from tfcpu.reference import outputs
+    for name in ("factorial", "primes"):
+        prog = assemble((EX / f"{name}.asm").read_text())
+        ref = run_ref(prog, 50_000)
+        e = NativeCPU(m32)
+        e.load(prog)
+        assert e.step(50_000) == len(ref) - 1
+        assert e.output == outputs(ref) and e.state() == ref[-1]

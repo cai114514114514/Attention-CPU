@@ -227,3 +227,37 @@ v1 的一层回绕中，阶跃单元激活（~2¹⁵）乘以 65536 达到 ~2³�
 边界：只跳过精确为零的权重和不会变化的行；不把指令语义编译成查表或分支——每一步都执行网络的注意力与 MLP 运算。
 
 验证：`tests/test_native.py` 在 300 个随机程序 × 200 步上逐步与完整模型比特级比较；示例程序的最终状态和步数与参考 CPU 相同。实测（M4 Max，单核）：一个 100 万步的循环程序 1.44 s（≈ 69 万条/秒）且结果与参考一致；bench 中冒泡排序 ≈ 66 万条/秒，约为 4004 上限的 7 倍。
+
+## 8. 扩展指令集（2026-11-07 追加）
+
+v2 实现完整的 17 条指令；v1 只实现原来的 9 条（`build_cpu("v1").ops`），`run()` 遇到 v1 不支持的指令会报错。原 0–8 号指令编号和语义不变。
+
+| 编号 | 指令 | 语义（未写明的 PC 更新均为 clampA(PC+1)） |
+|---|---|---|
+| 9 | `ADDI rd, ra, imm` | R[rd] = wrap(R[ra] + imm)；伪指令 `MOV rd, ra` = `ADDI rd, ra, 0` |
+| 10 | `JR ra` | PC = clampA(R[ra]) |
+| 11 | `CALL imm` | M[clampA(SP−1)] = clampA(PC+1)；SP = clampS(SP−1)；PC = clampA(imm) |
+| 12 | `RET` | PC = clampA(M[clampA(SP)])；SP = clampS(SP+1) |
+| 13 | `PUSH rs` | M[clampA(SP−1)] = R[rs]；SP = clampS(SP−1)（rs 存在 rb 字段） |
+| 14 | `POP rd` | R[rd] = M[clampA(SP)]；SP = clampS(SP+1) |
+| 15 | `MUL rd, ra, rb` | R[rd] = wrap(R[ra]·R[rb])，多周期，共 17 步（见下） |
+| 16 | `OUT ra` | out = R[ra]，out_flag = 1；其他任何执行的步 out_flag = 0 |
+
+新增持久字段（CPU token）：`sp`（0–64，初值 64 = 空栈，向下增长），`out, out_flag`，`mstep`（0–16），`ma, mb, macc`。`clampS(x) = min(max(x, 0), 64)`。停机后所有字段不变。
+
+### 8.1 多周期 MUL
+
+单周期精确 16 位乘法在"一个实数存一个字"的表示下需要拆字节、部分积与取模，至少 4 层 MLP、约 2000 个神经元。改为微码式多周期：
+
+- `mstep = 0`：ma = R[ra]，mb = R[rb]，macc = 0，mstep = 1，PC 不变；
+- `mstep = 1..16`：macc = wrap(2·macc + (mb < 0 ? ma : 0))，mb = wrap(2·mb)（从最高位开始的移位加）；mstep < 16 时 mstep += 1、PC 不变；mstep = 16 时 R[rd] = macc，mstep = 0，PC 前进。
+
+16 次迭代后 macc = a·b mod 2¹⁶（二进制补码乘积的低 16 位与符号无关）。每个微步只需判负、回绕位和二选一：B1 算出 `[mstep==0]`、`[mstep==16]`（带门控的 hat，条件含 op_MUL）、`[mb<0]` 以及 2·macc、2·macc+ma、2·mb 的回绕位（2·macc+ma ∈ [−98304, 98301]，两个阈值即可），B2 用门控写回——仍是 2 个块，约 40 个神经元，float32 精确。
+
+### 8.2 其余指令的电路
+
+都只是在已有的多路选择上增加候选：`ea` 增加 clampA(SP)（POP/RET），`sa` 增加 clampA(SP−1)（PUSH/CALL），`sv` 增加 clampA(PC+1)（CALL），寄存器写回增加 ADDI 与 POP，PC 增加 `jr`（JR）和 clampA(mv)（RET）。"x_new = target·cond − x·cond" 拆成两个独立的门控项，所以 RET 的 clampA(M[SP]) 不需要多一层。
+
+### 8.3 验证
+
+全部模型级测试按架构支持的指令集运行（v1：9 条；v2：17 条，含随机的 sp、mstep、乘法临时值与 out_flag）；参考 CPU 测试覆盖 SP 饱和、返回地址夹取、OUT 只持续一步、MUL 17 步与 300+ 组随机乘积；新增示例 `factorial.asm`（递归、栈、MUL、OUT）与 `primes.asm`。FastCPU 与 NativeCPU 在全指令集随机程序上与完整模型逐步比特级一致；NativeCPU 收集 OUT 输出流。

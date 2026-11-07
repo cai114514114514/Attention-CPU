@@ -1,4 +1,4 @@
-"""Instruction set and machine constants (spec §2)."""
+"""Instruction set and machine constants (spec §2, extended ISA §8)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +9,8 @@ WMIN, WMAX = -(1 << (WORD - 1)), (1 << (WORD - 1)) - 1
 NREG = 4
 NPROG = 64
 NMEM = 64
+SP_EMPTY = NMEM          # stack pointer value of an empty stack (grows down from the top of memory)
+MUL_STEPS = 16           # MUL: one setup step + 16 shift-and-add steps
 
 
 class Op(IntEnum):
@@ -21,9 +23,19 @@ class Op(IntEnum):
     JZ = 6
     JNEG = 7
     JMP = 8
+    # extended ISA
+    ADDI = 9
+    JR = 10
+    CALL = 11
+    RET = 12
+    PUSH = 13
+    POP = 14
+    MUL = 15
+    OUT = 16
 
 
 NOPS = len(Op)
+BASE_OPS = frozenset(Op(k) for k in range(9))      # the original nine (all that v1 implements)
 
 
 def wrap(x: int) -> int:
@@ -36,9 +48,19 @@ def clamp_a(x: int) -> int:
     return min(max(x, 0), NMEM - 1)
 
 
+def clamp_sp(x: int) -> int:
+    """Clamp a stack pointer to 0..64."""
+    return min(max(x, 0), SP_EMPTY)
+
+
+def mul16(a: int, b: int) -> int:
+    """Low 16 bits of a*b, as a signed word."""
+    return wrap(a * b)
+
+
 @dataclass(frozen=True)
 class Instr:
-    """One instruction. Unused fields are 0. STORE keeps rs in `rb`; JZ/JNEG test `ra`."""
+    """One instruction. Unused fields are 0. STORE/PUSH keep rs in `rb`; JZ/JNEG/JR/OUT use `ra`."""
 
     op: Op
     rd: int = 0
@@ -69,7 +91,21 @@ class Instr:
             return f"{o.name:<5} {r(self.rd)}, {r(self.ra)}, {r(self.rb)}"
         if o in (Op.JZ, Op.JNEG):
             return f"{o.name:<5} {r(self.ra)}, {self.imm}"
-        return f"JMP   {self.imm}"
+        if o is Op.JMP:
+            return f"JMP   {self.imm}"
+        if o is Op.ADDI:
+            return f"ADDI  {r(self.rd)}, {r(self.ra)}, {self.imm}"
+        if o in (Op.JR, Op.OUT):
+            return f"{o.name:<5} {r(self.ra)}"
+        if o is Op.CALL:
+            return f"CALL  {self.imm}"
+        if o is Op.RET:
+            return "RET"
+        if o is Op.PUSH:
+            return f"PUSH  {r(self.rb)}"
+        if o is Op.POP:
+            return f"POP   {r(self.rd)}"
+        return f"MUL   {r(self.rd)}, {r(self.ra)}, {r(self.rb)}"
 
 
 @dataclass(frozen=True)

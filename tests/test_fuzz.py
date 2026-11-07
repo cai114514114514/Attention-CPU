@@ -21,6 +21,8 @@ def expected(base: torch.Tensor, states, L) -> torch.Tensor:
     want[:, CPU, L["pc"]] = torch.tensor([s.pc for s in states], dtype=base.dtype)
     want[:, CPU, L["halted"]] = torch.tensor([float(s.halted) for s in states], dtype=base.dtype)
     want[:, MEM0:MEM0 + NMEM, L["val"]] = torch.tensor([s.mem for s in states], dtype=base.dtype)
+    for f in ("sp", "out", "out_flag", "mstep", "ma", "mb", "macc"):
+        want[:, CPU, L[f]] = torch.tensor([float(getattr(s, f)) for s in states], dtype=base.dtype)
     return want
 
 
@@ -28,7 +30,7 @@ def test_random_programs(model):
     rng = random.Random(20261107)
     total_steps = executed = 0
     for _ in range(N_PROGRAMS // CHUNK):
-        states = [rand_state(rng) for _ in range(CHUNK)]
+        states = [rand_state(rng, ops=tuple(sorted(model.ops))) for _ in range(CHUNK)]
         L, dt = model.layout, next(model.parameters()).dtype
         x = torch.stack([encode(s, L, dt) for s in states])
         base = x.clone()

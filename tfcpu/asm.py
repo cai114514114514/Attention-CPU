@@ -14,7 +14,10 @@ class AsmError(ValueError):
 _SIG = {
     Op.HALT: "", Op.LOADI: "ri", Op.LOAD: "rri", Op.STORE: "rri",
     Op.ADD: "rrr", Op.SUB: "rrr", Op.JZ: "ri", Op.JNEG: "ri", Op.JMP: "i",
+    Op.ADDI: "rri", Op.JR: "r", Op.CALL: "i", Op.RET: "", Op.PUSH: "r", Op.POP: "r",
+    Op.MUL: "rrr", Op.OUT: "r",
 }
+_PSEUDO = {"MOV": ("ADDI", "rr")}      # MOV rd, ra  ==  ADDI rd, ra, 0
 _LABEL = re.compile(r"^([A-Za-z_]\w*)\s*:")
 
 
@@ -66,6 +69,11 @@ def assemble(text: str) -> Program:
     # pass 2: encode
     instrs = []
     for lineno, head, ops in lines:
+        if head.upper() in _PSEUDO:
+            real, psig = _PSEUDO[head.upper()]
+            if len(ops) != len(psig):
+                raise _err(lineno, f"{head.upper()} takes {len(psig)} operand(s), got {len(ops)}")
+            head, ops = real, ops + ["0"]
         try:
             op = Op[head.upper()]
         except KeyError:
@@ -99,8 +107,18 @@ def assemble(text: str) -> Program:
             ins = Instr(op, rd=vals[0], ra=vals[1], rb=vals[2])
         elif op in (Op.JZ, Op.JNEG):
             ins = Instr(op, ra=vals[0], imm=vals[1])
-        elif op is Op.JMP:
+        elif op in (Op.JMP, Op.CALL):
             ins = Instr(op, imm=vals[0])
+        elif op is Op.ADDI:
+            ins = Instr(op, rd=vals[0], ra=vals[1], imm=vals[2])
+        elif op in (Op.JR, Op.OUT):
+            ins = Instr(op, ra=vals[0])
+        elif op is Op.PUSH:
+            ins = Instr(op, rb=vals[0])
+        elif op is Op.POP:
+            ins = Instr(op, rd=vals[0])
+        elif op is Op.MUL:
+            ins = Instr(op, rd=vals[0], ra=vals[1], rb=vals[2])
         else:
             ins = Instr(op)
         instrs.append(ins)

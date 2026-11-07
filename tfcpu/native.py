@@ -35,6 +35,7 @@ class _CSR(C.Structure):
 class _Model(C.Structure):
     _fields_ = [
         ("T", C.c_int32), ("d", C.c_int32), ("cpu", C.c_int32), ("mem0", C.c_int32), ("nmem", C.c_int32), ("halted", C.c_int32),
+        ("out", C.c_int32), ("out_flag", C.c_int32),
         ("dk1", C.c_int32), ("dv1", C.c_int32), ("q1", _CSR), ("o1", _CSR), ("K1", f32p), ("V1", f32p),
         ("m1a", _CSR), ("m1b", _CSR), ("c1a", f32p), ("c1b", f32p),
         ("H", C.c_int32), ("dk2", C.c_int32), ("dv2", C.c_int32),
@@ -56,7 +57,7 @@ def _load_lib():
             subprocess.run([cc, "-O3", "-std=c11", "-shared", "-fPIC", "-o", str(tmp), str(_SRC)], check=True)
             tmp.replace(so)
         _lib = C.CDLL(str(so))
-        _lib.tf_run.argtypes = [C.POINTER(_Model), f32p, C.c_int64]
+        _lib.tf_run.argtypes = [C.POINTER(_Model), f32p, C.c_int64, f32p, C.c_int64, C.POINTER(C.c_int64)]
         _lib.tf_run.restype = C.c_int64
     return _lib
 
@@ -70,6 +71,7 @@ class NativeCPU:
     """One machine. load(program | state | tensor), then step(n)."""
 
     ERRORS = {-1: "fetch tie", -2: "load tie", -3: "store-port tie"}
+    OUT_CAP = 1 << 16
 
     def __init__(self, model: LoopedTransformer):
         if getattr(model, "arch", None) != "v2":
@@ -117,16 +119,26 @@ class NativeCPU:
                      _arr(f.Qstore[0]), _arr(f.best_other[0])]
         K1, V1, K2, V2, Qs, best = self._dyn
         self._m = _Model(T=NTOK, d=self.L.d, cpu=CPU, mem0=MEM0, nmem=nmem, halted=self.L["halted"],
+                         out=self.L["out"], out_flag=self.L["out_flag"],
                          K1=K1.ctypes.data_as(f32p), V1=V1.ctypes.data_as(f32p),
                          K2=K2.ctypes.data_as(f32p), V2=V2.ctypes.data_as(f32p),
                          Qs=Qs.ctypes.data_as(f32p), best=best.ctypes.data_as(f32p), **self._static)
         self._xp = self.x_np.ctypes.data_as(f32p)
+        self._outbuf = np.zeros(self.OUT_CAP, dtype=np.float32)
+        self._nout = C.c_int64(0)
+        self.output: list[int] = []
 
     def step(self, n: int = 1) -> int:
-        """Run up to n steps (stopping after a HALT); returns how many ran."""
-        k = self._lib.tf_run(C.byref(self._m), self._xp, n)
+        """Run up to n steps (stopping after a HALT); returns how many ran. OUT values go to .output."""
+        self._nout.value = 0
+        k = self._lib.tf_run(C.byref(self._m), self._xp, n,
+                             self._outbuf.ctypes.data_as(f32p), self.OUT_CAP, C.byref(self._nout))
         if k < 0:
             raise RuntimeError(f"v2 invariant violated: {self.ERRORS.get(k, k)}")
+        got = self._nout.value
+        if got > self.OUT_CAP:
+            raise RuntimeError(f"more than {self.OUT_CAP} OUT values in one step() call")
+        self.output.extend(int(v) for v in self._outbuf[:got])
         return int(k)
 
     def state(self) -> State:
@@ -134,7 +146,7 @@ class NativeCPU:
 
 
 def run_native(model: LoopedTransformer, program: Program, max_steps: int = 10_000) -> tuple[State, int]:
-    """Run one program to HALT (or max_steps); returns (final state, steps executed)."""
+    """Run one program to HALT (or max_steps); returns (final state, steps executed). See NativeCPU.output."""
     e = NativeCPU(model)
     e.load(program)
     steps = e.step(max_steps)
