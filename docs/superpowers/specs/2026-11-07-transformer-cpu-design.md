@@ -186,3 +186,34 @@ for _ in range(max_steps):
 7. **纯度检查**（`test_purity.py`）：遍历模块树，只允许 `LoopedTransformer / Block / HardmaxAttention / MLP / nn.Linear / nn.ReLU`；`HardmaxAttention.forward` 中只做矩阵乘、取最大、平均。
 
 完成标准：以上测试全部通过，notebook 能从头到尾运行。
+
+## 7. v2 微架构与快速执行引擎（2026-11-07 追加）
+
+v1 保留不变（`build_cpu("v1")`，§4）。v2 是同一台机器、同一套持久字段和编码，只换内部结构，默认 `build_cpu()` 即 v2。
+
+### 7.1 两个块
+
+| 块 | Attention | MLP（一层） |
+|---|---|---|
+| B1 | CPU 以 `pc` 取指（1 头） | 投机执行：`ea`、`sa` 用带门控的 clamp 同时完成"选寄存器 + 夹取"；`sv = R[rb]`；ADD/SUB 对 16 种 (ra, rb) 组合各算原始和与溢出位（`*_raw, *_hi, *_lo`）；`take` 把判零/判负与 ra 选择、opcode 合并成带门控的 hat；`sen, jt, npc` |
+| B2 | 3 头：读端口（CPU 以 `ea` 读 MEM）+ 两个写地址比较器 | 写回寄存器（候选值 `imm / mv / raw ∓ 65536·hi ± 65536·lo`）、PC、halted、`val`；清空草稿 |
+
+两层 attention 是下限：读内存依赖取到的指令。
+
+### 7.2 写端口：两个线性比较器
+
+MEM token i 作为 query，对 CPU 的 key 打分 `ATT_BIG + (sa − aᵢ + ½) − STORE_OFF·(1 − sen)`（头 ge）或 `ATT_BIG + (aᵢ − sa + ½) − …`（头 le）；每个 MEM key 都恰好得 `ATT_BIG`，PROG key 得 0。于是 CPU 赢头 ge ⇔ sa ≥ aᵢ，赢头 le ⇔ sa ≤ aᵢ，与 MEM 分数至少差 ½，不会并列。CPU 输时 query 在 64 个并列的 MEM key 上平均，而它们被复制的值 `(sv, is_cpu)` 全是 0，结果仍精确。B2 的写入门控为 `got_ge ∧ got_le ∧ is_mem`。
+
+只在 sa = aᵢ 处取峰值的单头打分需要在 key 里放 sa²，它不是残差流的线性函数——这正是最初单头写端口的错误（它在 sa ≥ aᵢ 时都可能赢），已由测试发现并改为双比较器。
+
+### 7.3 float32 精确
+
+v1 的一层回绕中，阶跃单元激活（~2¹⁵）乘以 65536 达到 ~2³¹，float32 不精确。v2 在 B1 只输出 0/1 溢出位，在 B2 才乘 65536；门控常数 M = 2²⁰、条件数 ≤ 5，所有中间量 < 2²⁴，float32 精确，可在 MPS 上运行。
+
+### 7.4 FastCPU（`tfcpu/fast.py`）
+
+同一套权重、同样的运算，只算会变的行：每步只有 CPU 行和至多一个被写的 MEM 行会变。缓存 PROG/MEM 的 key/value（取指端口、读端口的 key 永不变化；读端口的 value 只在写入时更新一行）；写端口只算 64 个 MEM query 与 CPU key 的分数，并与缓存的"其余 key 最高分"比较。依赖的不变式由 `tests/test_fast.py` 在 500 个随机程序 × 300 步上逐步与完整模型做比特级比较来保证（CPU 与 MPS）。
+
+### 7.5 验证
+
+所有模型级测试（单步、示例程序、随机差分 2000 × 300、纯度）在 v1-float64、v2-float64、v2-float32 三种配置上运行；另有 FastCPU ≡ 完整模型、构建参数检查。`bench.py` 输出各配置的指令/秒，并在计时后抽查结果正确性。

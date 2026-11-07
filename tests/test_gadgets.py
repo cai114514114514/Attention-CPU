@@ -85,3 +85,34 @@ def test_output_bias_and_accumulation():
     out = run(lambda b: (copy(b, F("x"), "out"), copy(b, F("y"), "out", coef=2), b.bias("out", -1000)),
               [{"x": 3, "y": 4}])
     assert out == [3 + 8 - 1000]
+
+
+def test_gated_step_neg_clamp():
+    rows = [{"x": v, "s1": s} for v in range(-70000, 70001, 13) for s in (0, 1)]
+    out = run(lambda b: step_ge(b, F("x"), 32768, "out", conds=[F("s1")]), rows)
+    assert out == [float(r["x"] >= 32768 and r["s1"] == 1) for r in rows]
+    out = run(lambda b: is_neg(b, F("x"), "out", conds=[F("s1")]), rows)
+    assert out == [float(r["x"] < 0 and r["s1"] == 1) for r in rows]
+    rows = [{"x": v, "s1": s} for v in range(-65536, 65535, 3) for s in (0, 1)]
+    out = run(lambda b: clamp(b, F("x"), 0, 63, "out", conds=[F("s1")]), rows)
+    assert out == [float(min(max(r["x"], 0), 63) * r["s1"]) for r in rows]
+
+
+def test_gated_clamp_rejects_nonzero_lo():
+    import pytest
+    with pytest.raises(ValueError):
+        clamp(MLPBuilder(L), F("x"), 1, 63, "out", conds=[F("s1")])
+
+
+def test_float32_gate_is_exact_at_extremes():
+    b = MLPBuilder(L)
+    gate(b, F("x") - F("y"), [F("s1"), F("s2"), F("s3"), F("one") - F("one") * 0], "out")
+    mlp = b.build().float()
+    vals = [-98303, -65535, -1, 0, 1, 65535, 98303]
+    x = torch.zeros(len(vals) * 2, L.d)
+    for i, v in enumerate(vals * 2):
+        x[i, L["one"]] = 1; x[i, L["x"]] = v
+        x[i, L["s1"]] = x[i, L["s2"]] = x[i, L["s3"]] = float(i < len(vals))
+    with torch.no_grad():
+        y = (x + mlp(x))[:, L["out"]].tolist()
+    assert y == [float(v) for v in vals] + [0.0] * len(vals)

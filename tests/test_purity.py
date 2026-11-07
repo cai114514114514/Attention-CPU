@@ -16,10 +16,10 @@ def test_only_transformer_parts(model):
     for name, p in model.named_parameters():
         owner = model.get_submodule(name.rsplit(".", 1)[0])
         assert isinstance(owner, nn.Linear), f"{name} lives outside a Linear layer"
-    assert len(model.blocks) == 6
+    assert len(model.blocks) == {"v1": 6, "v2": 2}[model.arch]
 
 
 def test_driver_loop_only_feeds_back():
     src = inspect.getsource(run_fn)
     writes = re.findall(r"^\s*x\s*=\s*(.+?)\s*(?:#.*)?$", src, re.M)
-    assert writes == ["encode(initial_state(program))", "model(x)"]
+    assert writes == ["encode(initial_state(program), L, p.dtype).to(p.device)", "model(x)"]

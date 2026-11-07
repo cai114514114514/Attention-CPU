@@ -29,11 +29,12 @@ class Trace:
 
 @torch.no_grad()
 def run(model: LoopedTransformer, program: Program, max_steps: int = 10_000) -> Trace:
-    x = encode(initial_state(program))
-    trace = Trace([decode(x)])
+    L, p = model.layout, next(model.parameters())
+    x = encode(initial_state(program), L, p.dtype).to(p.device)
+    trace = Trace([decode(x, L)])
     for _ in range(max_steps):
         x = model(x)                     # <- the whole computation
-        trace.states.append(decode(x))   # observation only
+        trace.states.append(decode(x, L))  # observation only
         if trace.final.halted:
             break
     return trace

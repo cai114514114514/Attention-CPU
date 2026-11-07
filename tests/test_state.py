@@ -19,7 +19,7 @@ def test_roundtrip():
 def test_decode_rejects_dirty_scratch_and_foreign_fields():
     s = rand_state(random.Random(2))
     x = encode(s)
-    y = x.clone(); y[5, LAYOUT["A"]] = 1
+    y = x.clone(); y[5, LAYOUT["ea"]] = 1
     with pytest.raises(DecodeError, match="scratch"):
         decode(y)
     y = x.clone(); y[100, LAYOUT["R2"]] = 3          # a register value on a MEM token

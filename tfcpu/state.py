@@ -19,7 +19,8 @@ class DecodeError(ValueError):
     pass
 
 
-def encode(s: State, L: Layout = LAYOUT) -> torch.Tensor:
+def encode(s: State, L: Layout = LAYOUT, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """Canonical encoding: persistent fields set, scratch zero. Same persistent layout for every arch."""
     x = np.zeros((NTOK, L.d), dtype=np.float64)
     x[:, L["one"]] = 1.0
     x[CPU, L["is_cpu"]] = 1.0
@@ -43,7 +44,7 @@ def encode(s: State, L: Layout = LAYOUT) -> torch.Tensor:
     x[rows, L["a"]] = addr
     x[rows, L["a2"]] = addr * addr
     x[rows, L["val"]] = s.mem
-    return torch.from_numpy(x)
+    return torch.from_numpy(x).to(dtype)
 
 
 def _int(v: float, what: str) -> int:
@@ -61,6 +62,7 @@ def _onehot(row: torch.Tensor, names: list[str], L: Layout, what: str) -> int:
 
 def decode(x: torch.Tensor, L: Layout = LAYOUT) -> State:
     """Read the machine state back out; raises DecodeError if any invariant is broken."""
+    x = x.detach().cpu()
     if tuple(x.shape) != (NTOK, L.d):
         raise DecodeError(f"expected shape {(NTOK, L.d)}, got {tuple(x.shape)}")
     if (x[:, [L[n] for n in L.scratch]] != 0).any():
@@ -80,6 +82,6 @@ def decode(x: torch.Tensor, L: Layout = LAYOUT) -> State:
         prog.append(Instr(Op(op), rd, ra, rb, _int(float(row[L["imm"]]), f"PROG[{j}].imm")))
     mem = tuple(_int(float(x[MEM0 + j, L["val"]]), f"M[{j}]") for j in range(NMEM))
     out = State(tuple(prog), regs, pc, bool(halted), mem)
-    if not torch.equal(encode(out, L), x):
+    if not torch.equal(encode(out, L, x.dtype), x):
         raise DecodeError("tensor is not a canonical encoding (stray values in foreign fields)")
     return out

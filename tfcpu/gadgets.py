@@ -94,18 +94,23 @@ def copy(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0) -> None:
     b.relu(-x, {dst: -coef})
 
 
-def step_ge(b: MLPBuilder, x: Aff, t: int, dst: str, coef: float = 1.0) -> None:
-    """[x >= t] for integer x."""
-    b.relu(x - (t - 1), {dst: coef})
-    b.relu(x - t, {dst: -coef})
-
-
 def _shift(conds) -> Aff:
-    """M * (k - sum s_i): 0 when every binary condition holds, >= M otherwise."""
+    """M * (k - sum s_i): 0 when every binary condition holds, >= M otherwise.
+
+    Subtracting it from a unit's pre-activation switches the unit off unless all
+    conditions hold, which is how every gadget below gets an optional `conds`.
+    """
     s = Aff()
     for c in conds:
         s = s + c
     return (len(conds) - s) * BIG
+
+
+def step_ge(b: MLPBuilder, x: Aff, t: int, dst: str, coef: float = 1.0, conds=()) -> None:
+    """[x >= t] (and all conds) for integer x."""
+    sh = _shift(conds)
+    b.relu(x - (t - 1) - sh, {dst: coef})
+    b.relu(x - t - sh, {dst: -coef})
 
 
 def is_zero(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0, conds=()) -> None:
@@ -116,22 +121,31 @@ def is_zero(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0, conds=()) -> Non
     b.relu(x - 1 - sh, {dst: coef})
 
 
-def is_neg(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0) -> None:
-    """[x < 0] for integer x."""
-    b.relu(-x, {dst: coef})
-    b.relu(-x - 1, {dst: -coef})
+def is_neg(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0, conds=()) -> None:
+    """[x < 0] (and all conds) for integer x."""
+    sh = _shift(conds)
+    b.relu(-x - sh, {dst: coef})
+    b.relu(-x - 1 - sh, {dst: -coef})
 
 
-def clamp(b: MLPBuilder, x: Aff, lo: int, hi: int, dst: str, coef: float = 1.0) -> None:
-    """min(max(x, lo), hi) = lo + relu(x - lo) - relu(x - hi)."""
+def clamp(b: MLPBuilder, x: Aff, lo: int, hi: int, dst: str, coef: float = 1.0, conds=()) -> None:
+    """min(max(x, lo), hi) = lo + relu(x - lo) - relu(x - hi); gated version needs lo == 0."""
+    if conds and lo:
+        raise ValueError("a gated clamp needs lo == 0 (the constant lo cannot be gated)")
+    sh = _shift(conds)
     if lo:
         b.bias(dst, coef * lo)
-    b.relu(x - lo, {dst: coef})
-    b.relu(x - hi, {dst: -coef})
+    b.relu(x - lo - sh, {dst: coef})
+    b.relu(x - hi - sh, {dst: -coef})
 
 
 def wrap16(b: MLPBuilder, x: Aff, dst: str, coef: float = 1.0) -> None:
-    """16-bit two's-complement wrap of an integer x in [-65536, 65534]."""
+    """16-bit two's-complement wrap of an integer x in [-65536, 65534], in one layer.
+
+    Exact in float64 only: the step units' activations (~2^15) times 65536 reach
+    ~2^31. The float32-exact v2 computes the overflow bits first and scales them
+    in the next layer instead.
+    """
     copy(b, x, dst, coef)
     step_ge(b, x, 1 << 15, dst, -coef * (1 << 16))
     step_ge(b, -x, (1 << 15) + 1, dst, coef * (1 << 16))   # [x < -32768]
